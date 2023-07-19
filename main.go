@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"strings"
@@ -16,16 +17,27 @@ import (
 const (
 	shortUrlLength = 5
 	letters        = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	numNodes       = 3
 )
 
 var (
-	redisClient *redis.Client
-	mu          sync.Mutex
-	randSource  rand.Source
+	redisClient      *redis.Client
+	mu               sync.Mutex
+	randSource       rand.Source
+	currentNodeIndex int32
+	currentNodeMutex sync.Mutex
+	serverMutex      sync.Mutex
+	backendClient    *http.Client
 )
 
 func init() {
 	randSource = rand.NewSource(time.Now().UnixNano())
+	backendClient = &http.Client{
+		Transport: &http.Transport{
+			MaxIdleConnsPerHost: numNodes,
+		},
+		Timeout: time.Second * 5,
+	}
 }
 
 func main() {
@@ -56,35 +68,28 @@ func main() {
 
 	// create new router for the frontend (8080 port)
 	frontendRouter := mux.NewRouter()
+	frontendRouter.HandleFunc("/shorten", shortenUrlHandler).Methods("GET", "POST") // Use frontend handler directly
 	frontendRouter.HandleFunc("/{shortCode}", redirectHandler).Methods("GET")
 
-	// serve message for shortened URLs on web broswer
+	// serve message for shortened URLs on the web browser
 	go func() {
-		http.Handle("/", frontendRouter)
 		fmt.Println("Frontend server is running on http://localhost:8080")
-		http.ListenAndServe(":8080", nil)
+		http.ListenAndServe(":8080", frontendRouter) // Use frontend router directly
 	}()
 
-	// start first http server on port 8081
-	go func() {
-		fmt.Println("Server 1 is running on http://localhost:8081")
-		http.ListenAndServe(":8081", r1)
-	}()
-
-	// start the second http server on port 8082
-	go func() {
-		fmt.Println("Server 2 is running on http://localhost:8082")
-		http.ListenAndServe(":8082", r2)
-	}()
-
-	// start the third http server on port 8082
-	go func() {
-		fmt.Println("Server 3 is running on http://localhost:8083")
-		http.ListenAndServe(":8083", r3)
-	}()
+	// start node cluster (3 servers)
+	go runNode(0, r1)
+	go runNode(1, r2)
+	go runNode(2, r3)
 
 	// Keep the main goroutine running
 	select {}
+}
+
+func runNode(nodeIndex int, router *mux.Router) {
+	port := 8081 + nodeIndex
+	fmt.Printf("Server %d is running on http://localhost:%d\n", nodeIndex+1, port)
+	http.ListenAndServe(fmt.Sprintf(":%d", port), router)
 }
 
 func shortenUrlHandler(w http.ResponseWriter, r *http.Request) {
@@ -94,14 +99,60 @@ func shortenUrlHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// generate the shortened URL using the shortenUrl function.
 	shortUrl := shortenUrl(url)
-	if err := storeUrlMapping(shortUrl, url); err != nil {
+
+	// get the next backend node in the round-robin sequence
+	currentNodeMutex.Lock()
+	nodePort := 8081 + currentNodeIndex
+	currentNodeIndex = (currentNodeIndex + 1) % numNodes
+	currentNodeMutex.Unlock()
+
+	// Prepare the URL for forwarding the request to the selected backend node
+	targetURL := fmt.Sprintf("http://localhost:%d/shorten", nodePort)
+
+	// Create a new POST request with the "url" parameter
+	req, err := http.NewRequest("POST", targetURL, strings.NewReader("url="+url))
+	if err != nil {
+		http.Error(w, "Failed to create request, posting", http.StatusInternalServerError)
+		return
+	}
+
+	// Set the appropriate Content-Type header
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	// Perform the request to the backend node
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		http.Error(w, "Failed to process request, request to backend node", http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+
+	// read the response from the backend node
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Failed to process request, load response", http.StatusInternalServerError)
+		return
+	}
+
+	shortCode := string(body)
+	if shortCode == "" {
+		http.Error(w, "Failed to process request, short code", http.StatusInternalServerError)
+		return
+	}
+
+	// extract the short code from the full shortened URL
+	shortCode = extractShortCode(shortCode)
+
+	// use the extracted short code to store the URL mapping in Redis.
+	if err := storeUrlMapping(shortCode, url); err != nil {
 		http.Error(w, "Failed to store URL mapping", http.StatusInternalServerError)
 		return
 	}
 
-	// respond with shortened url
-	fmt.Fprintf(w, "Shortened URL: %s", shortUrl)
+	// write the shortened URL back to the client.
+	w.Write([]byte(shortUrl))
 }
 
 func shortenUrl(url string) string {
